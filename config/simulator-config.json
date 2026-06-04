@@ -1,0 +1,27 @@
+{
+  "simulator": {
+    "enabled": true,
+    "frequency": {
+      "minInterval": 1000,
+      "maxInterval": 5000,
+      "operationProbability": 0.8
+    },
+    "containerTypes": {
+      "20GP": { "weight": { "min": 5, "max": 25 }, "probability": 0.45 },
+      "40GP": { "weight": { "min": 10, "max": 30 }, "probability": 0.30 },
+      "40HC": { "weight": { "min": 10, "max": 30 }, "probability": 0.20 },
+      "20RF": { "weight": { "min": 5, "max": 20 }, "probability": 0.05 }
+    },
+    "dangerousGoods": {
+      "probability": 0.1,
+      "types": ["易燃品", "腐蚀品", "氧化剂"]
+    },
+    "unloading": {
+      "probability": 0.4
+    },
+    "logging": {
+      "enabled": true,
+      "level": "info"
+    }
+  }
+}

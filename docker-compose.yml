@@ -1,0 +1,82 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    container_name: port-yard-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: port_yard_monitor
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    command: >
+      postgres
+      -c max_connections=100
+      -c shared_buffers=256MB
+      -c effective_cache_size=768MB
+      -c maintenance_work_mem=64MB
+      -c checkpoint_completion_target=0.9
+      -c wal_buffers=16MB
+      -c default_statistics_target=100
+      -c random_page_cost=1.1
+      -c effective_io_concurrency=200
+      -c work_mem=65536
+      -c min_wal_size=1GB
+      -c max_wal_size=4GB
+    healthcheck:
+        test: ["CMD-SHELL", "pg_isready -U postgres"]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+    restart: unless-stopped
+    networks:
+      - port-yard-network
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: port-yard-app
+    environment:
+      NODE_ENV: production
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: port_yard_monitor
+      DB_POOL_MIN: 2
+      DB_POOL_MAX: 20
+    ports:
+      - "3000:3000"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - port-yard-network
+
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: port-yard-pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@port-yard.com
+      PGADMIN_DEFAULT_PASSWORD: admin123
+    ports:
+      - "5050:80"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+    networks:
+      - port-yard-network
+
+volumes:
+  postgres_data:
+
+networks:
+  port-yard-network:
+    driver: bridge
