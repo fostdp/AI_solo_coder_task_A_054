@@ -5,6 +5,8 @@ use crate::alerts::AlertSystem;
 use actix_web::{web, HttpResponse, Responder};
 use chrono::{DateTime, Utc, Duration};
 use serde::Deserialize;
+use tokio_postgres::binary_copy::BinaryCopyInWriter;
+use tokio_postgres::types::Type;
 
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
@@ -580,13 +582,17 @@ pub async fn receive_nb_iot_data(
 ) -> impl Responder {
     let client = match pool.get().await {
         Ok(c) => c,
-        Err(e) => return HttpResponse::InternalServerError().json(
-            ApiResponse::<String> {
-                success: false,
-                message: format!("Database error: {}", e),
-                data: None,
-            }
-        ),
+        Err(e) => {
+            let msg = format!("Database connection pool error: {}", e);
+            tracing::warn!("NB-IoT data rejected: {}", msg);
+            return HttpResponse::ServiceUnavailable().json(
+                ApiResponse::<String> {
+                    success: false,
+                    message: msg,
+                    data: None,
+                }
+            );
+        }
     };
 
     let sensor_row = match client.query_opt(
@@ -734,4 +740,248 @@ pub async fn get_statistics(
         message: "Success".to_string(),
         data: Some(serde_json::Value::Object(stats)),
     })
+}
+
+pub async fn receive_nb_iot_batch(
+    pool: web::Data<DbPool>,
+    body: web::Json<Vec<NbIotDataPacket>>,
+) -> impl Responder {
+    if body.len() > 100 {
+        return HttpResponse::BadRequest().json(ApiResponse::<String> {
+            success: false,
+            message: "Batch size exceeds limit of 100".to_string(),
+            data: None,
+        });
+    }
+
+    let client = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => {
+            let msg = format!("Database connection pool error: {}", e);
+            tracing::warn!("NB-IoT batch rejected: {}", msg);
+            return HttpResponse::ServiceUnavailable().json(
+                ApiResponse::<String> {
+                    success: false,
+                    message: msg,
+                    data: None,
+                }
+            );
+        }
+    };
+
+    let device_ids: Vec<String> = body.iter().map(|p| p.device_id.clone()).collect();
+
+    let sensor_rows = match client.query(
+        "SELECT id, device_id, lacquer_ware_id, sensor_type FROM sensors WHERE device_id = ANY($1)",
+        &[&device_ids],
+    ).await {
+        Ok(r) => r,
+        Err(e) => {
+            return HttpResponse::InternalServerError().json(ApiResponse::<String> {
+                success: false,
+                message: format!("Sensor lookup failed: {}", e),
+                data: None,
+            });
+        }
+    };
+
+    let mut sensor_map: std::collections::HashMap<String, (i32, i32, String)> =
+        std::collections::HashMap::new();
+    for row in sensor_rows {
+        let id: i32 = row.get("id");
+        let device_id: String = row.get("device_id");
+        let lacquer_ware_id: Option<i32> = row.get("lacquer_ware_id");
+        let sensor_type: String = row.get("sensor_type");
+        if let Some(lid) = lacquer_ware_id {
+            sensor_map.insert(device_id, (id, lid, sensor_type));
+        }
+    }
+
+    let mut moisture_rows: Vec<(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)> = Vec::new();
+    let mut strain_rows: Vec<(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)> = Vec::new();
+    let mut fail_count = 0usize;
+
+    for packet in body.iter() {
+        match sensor_map.get(&packet.device_id) {
+            Some((sensor_id, lacquer_id, sensor_type)) => {
+                let row = (
+                    packet.timestamp,
+                    *sensor_id,
+                    *lacquer_id,
+                    packet.value,
+                    packet.temperature,
+                    packet.battery_level,
+                    packet.signal_strength,
+                );
+                if sensor_type == "moisture" {
+                    moisture_rows.push(row);
+                } else if sensor_type == "strain" {
+                    strain_rows.push(row);
+                } else {
+                    fail_count += 1;
+                }
+            }
+            None => { fail_count += 1; }
+        }
+    }
+
+    let mut success_count: usize = 0;
+
+    if !moisture_rows.is_empty() {
+        let inserted = batch_copy_insert_moisture(&client, &moisture_rows).await;
+        success_count += inserted;
+        fail_count += moisture_rows.len() - inserted;
+    }
+
+    if !strain_rows.is_empty() {
+        let inserted = batch_copy_insert_strain(&client, &strain_rows).await;
+        success_count += inserted;
+        fail_count += strain_rows.len() - inserted;
+    }
+
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: format!("Batch processed: {} success, {} failed", success_count, fail_count),
+        data: Some(format!("{}/{}", success_count, success_count + fail_count)),
+    })
+}
+
+async fn batch_copy_insert_moisture(
+    client: &deadpool_postgres::Object,
+    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
+) -> usize {
+    let copy_stmt = match client.prepare(
+        "COPY moisture_data (time, sensor_id, lacquer_ware_id, moisture_content, temperature, battery_level, signal_strength) FROM STDIN WITH (FORMAT binary)"
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("COPY moisture_data prepare failed, falling back to INSERT: {}", e);
+            return batch_fallback_insert_moisture(client, rows).await;
+        }
+    };
+
+    let types = [Type::TIMESTAMPTZ, Type::INT4, Type::INT4, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8];
+    let sink = match client.copy_in(&copy_stmt).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("COPY moisture_data init failed, falling back: {}", e);
+            return batch_fallback_insert_moisture(client, rows).await;
+        }
+    };
+
+    let writer = BinaryCopyInWriter::new(sink, &types);
+    let mut writer = std::pin::pin!(writer);
+
+    for row in rows {
+        if writer.as_mut().write(&[
+            &row.0 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.1 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.2 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.3 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.4 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.5 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.6 as &(dyn tokio_postgres::types::ToSql + Sync),
+        ]).await.is_err() {
+            tracing::error!("COPY moisture_data write failed");
+            return batch_fallback_insert_moisture(client, rows).await;
+        }
+    }
+
+    match writer.finish().await {
+        Ok(_) => {
+            tracing::info!("COPY moisture_data: {} rows via binary COPY", rows.len());
+            rows.len()
+        }
+        Err(e) => {
+            tracing::error!("COPY moisture_data finish failed: {}", e);
+            batch_fallback_insert_moisture(client, rows).await
+        }
+    }
+}
+
+async fn batch_fallback_insert_moisture(
+    client: &deadpool_postgres::Object,
+    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
+) -> usize {
+    let mut count = 0usize;
+    for row in rows {
+        match client.execute(
+            "INSERT INTO moisture_data (time, sensor_id, lacquer_ware_id, moisture_content, temperature, battery_level, signal_strength) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[&row.0, &row.1, &row.2, &row.3, &row.4, &row.5, &row.6],
+        ).await {
+            Ok(_) => count += 1,
+            Err(e) => tracing::warn!("Fallback INSERT moisture failed: {}", e),
+        }
+    }
+    count
+}
+
+async fn batch_copy_insert_strain(
+    client: &deadpool_postgres::Object,
+    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
+) -> usize {
+    let copy_stmt = match client.prepare(
+        "COPY strain_data (time, sensor_id, lacquer_ware_id, strain_value, temperature, battery_level, signal_strength) FROM STDIN WITH (FORMAT binary)"
+    ).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("COPY strain_data prepare failed, falling back to INSERT: {}", e);
+            return batch_fallback_insert_strain(client, rows).await;
+        }
+    };
+
+    let types = [Type::TIMESTAMPTZ, Type::INT4, Type::INT4, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8];
+    let sink = match client.copy_in(&copy_stmt).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::error!("COPY strain_data init failed, falling back: {}", e);
+            return batch_fallback_insert_strain(client, rows).await;
+        }
+    };
+
+    let writer = BinaryCopyInWriter::new(sink, &types);
+    let mut writer = std::pin::pin!(writer);
+
+    for row in rows {
+        if writer.as_mut().write(&[
+            &row.0 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.1 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.2 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.3 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.4 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.5 as &(dyn tokio_postgres::types::ToSql + Sync),
+            &row.6 as &(dyn tokio_postgres::types::ToSql + Sync),
+        ]).await.is_err() {
+            tracing::error!("COPY strain_data write failed");
+            return batch_fallback_insert_strain(client, rows).await;
+        }
+    }
+
+    match writer.finish().await {
+        Ok(_) => {
+            tracing::info!("COPY strain_data: {} rows via binary COPY", rows.len());
+            rows.len()
+        }
+        Err(e) => {
+            tracing::error!("COPY strain_data finish failed: {}", e);
+            batch_fallback_insert_strain(client, rows).await
+        }
+    }
+}
+
+async fn batch_fallback_insert_strain(
+    client: &deadpool_postgres::Object,
+    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
+) -> usize {
+    let mut count = 0usize;
+    for row in rows {
+        match client.execute(
+            "INSERT INTO strain_data (time, sensor_id, lacquer_ware_id, strain_value, temperature, battery_level, signal_strength) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+            &[&row.0, &row.1, &row.2, &row.3, &row.4, &row.5, &row.6],
+        ).await {
+            Ok(_) => count += 1,
+            Err(e) => tracing::warn!("Fallback INSERT strain failed: {}", e),
+        }
+    }
+    count
 }
