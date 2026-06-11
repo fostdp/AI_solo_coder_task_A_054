@@ -2,6 +2,7 @@ use crate::db::DbPool;
 use crate::config::AlertConfig;
 use crate::models::{Alert, MoistureData, StrainData};
 use crate::nbiot_ingest::IngestEvent;
+use crate::metrics::Metrics;
 use tokio::sync::mpsc::Receiver;
 use chrono::{DateTime, Utc};
 use std::collections::HashMap;
@@ -175,6 +176,8 @@ impl AlertBroker {
 
         self.send_sms_alert(&alert).await.ok();
         self.send_satellite_alert(&alert).await.ok();
+
+        Metrics::get().alerts_triggered_total.inc();
 
         Ok(alert)
     }
