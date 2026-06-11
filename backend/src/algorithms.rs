@@ -40,24 +40,25 @@ impl FickianDiffusionModel {
         time_hours: f64,
         num_points: usize,
     ) -> (Vec<f64>, Vec<f64>, f64) {
-        let mut time_points = Vec::with_capacity(num_points);
-        let mut moisture_values = Vec::with_capacity(num_points);
-
-        let l = self.thickness;
+        let num_points = num_points.max(2);
+        let l = self.thickness.max(1e-10);
         let c0 = initial_moisture;
         let ce = target_moisture;
         let num_spatial = 21;
         let dx = l / (num_spatial - 1) as f64;
 
-        let dt_hours = time_hours / (num_points - 1).max(1) as f64;
+        let dt_hours = time_hours / (num_points - 1) as f64;
         let dt_seconds = dt_hours * 3600.0;
 
-        let max_d = self.diffusion_coefficient;
+        let max_d = self.diffusion_coefficient.max(1e-20);
         let stability_limit = 0.4 * dx * dx / max_d;
         let sub_steps = ((dt_seconds / stability_limit).ceil() as usize).max(1);
         let sub_dt = dt_seconds / sub_steps as f64;
 
         let mut concentration = vec![c0; num_spatial];
+
+        let mut time_points = Vec::with_capacity(num_points);
+        let mut moisture_values = Vec::with_capacity(num_points);
 
         time_points.push(0.0);
         moisture_values.push(c0);
@@ -72,12 +73,12 @@ impl FickianDiffusionModel {
                     let c_right = concentration[i + 1];
 
                     let d_left = self.effective_diffusion_coefficient(
-                        self.diffusion_coefficient,
+                        max_d,
                         (c_left + c_center) / 2.0,
                         c0,
                     );
                     let d_right = self.effective_diffusion_coefficient(
-                        self.diffusion_coefficient,
+                        max_d,
                         (c_center + c_right) / 2.0,
                         c0,
                     );
@@ -105,7 +106,7 @@ impl FickianDiffusionModel {
         }
 
         let d_avg = self.effective_diffusion_coefficient(
-            self.diffusion_coefficient,
+            max_d,
             (c0 + ce) / 2.0,
             c0,
         );
@@ -167,16 +168,17 @@ impl FickianDiffusionModel {
         time_hours: f64,
         num_time_points: usize,
     ) -> (Vec<f64>, Vec<f64>, Vec<Vec<f64>>, f64) {
-        let l = self.thickness;
+        let num_time_points = num_time_points.max(2);
+        let l = self.thickness.max(1e-10);
         let c0 = initial_moisture;
         let ce = target_moisture;
         let num_spatial = 21;
         let dx = l / (num_spatial - 1) as f64;
 
-        let dt_hours = time_hours / (num_time_points - 1).max(1) as f64;
+        let dt_hours = time_hours / (num_time_points - 1) as f64;
         let dt_seconds = dt_hours * 3600.0;
 
-        let max_d = self.diffusion_coefficient;
+        let max_d = self.diffusion_coefficient.max(1e-20);
         let stability_limit = 0.4 * dx * dx / max_d;
         let sub_steps = ((dt_seconds / stability_limit).ceil() as usize).max(1);
         let sub_dt = dt_seconds / sub_steps as f64;
@@ -201,12 +203,12 @@ impl FickianDiffusionModel {
                     let c_right = concentration[i + 1];
 
                     let d_left = self.effective_diffusion_coefficient(
-                        self.diffusion_coefficient,
+                        max_d,
                         (c_left + c_center) / 2.0,
                         c0,
                     );
                     let d_right = self.effective_diffusion_coefficient(
-                        self.diffusion_coefficient,
+                        max_d,
                         (c_center + c_right) / 2.0,
                         c0,
                     );
@@ -234,7 +236,7 @@ impl FickianDiffusionModel {
         }
 
         let d_avg = self.effective_diffusion_coefficient(
-            self.diffusion_coefficient,
+            max_d,
             (c0 + ce) / 2.0,
             c0,
         );
@@ -361,5 +363,29 @@ mod tests {
         assert_eq!(depths.len(), 50);
         assert!(depths[0] < depths[depths.len() - 1]);
         assert!(final_depth > 0.0);
+    }
+
+    #[test]
+    fn test_edge_case_zero_thickness() {
+        let model = FickianDiffusionModel::new(Some(1e-9), Some(0.0));
+        let (times, moistures, _) = model.predict_moisture_loss(80.0, 12.0, 720.0, 10);
+        assert_eq!(times.len(), 10);
+        assert!(moistures.iter().all(|m| m.is_finite()));
+    }
+
+    #[test]
+    fn test_edge_case_single_point() {
+        let model = FickianDiffusionModel::new(Some(1e-9), Some(0.01));
+        let (times, moistures, _) = model.predict_moisture_loss(80.0, 12.0, 720.0, 1);
+        assert_eq!(times.len(), 2);
+        assert_eq!(moistures.len(), 2);
+    }
+
+    #[test]
+    fn test_edge_case_zero_diffusion() {
+        let model = FickianDiffusionModel::new(Some(0.0), Some(0.01));
+        let (times, moistures, _) = model.predict_moisture_loss(80.0, 12.0, 720.0, 10);
+        assert_eq!(times.len(), 10);
+        assert!(moistures.iter().all(|m| m.is_finite()));
     }
 }
