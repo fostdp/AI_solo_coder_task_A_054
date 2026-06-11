@@ -1,13 +1,16 @@
 mod models;
 mod db;
-mod algorithms;
-mod alerts;
+mod config;
+mod nbiot_ingest;
+mod moisture_diffusion;
+mod peg_penetration;
+mod alert_broker;
 mod handlers;
 
 use actix_web::{web, App, HttpServer, middleware};
 use actix_cors::Cors;
 use dotenvy::dotenv;
-use std::env;
+use tokio::sync::mpsc;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
 
@@ -25,27 +28,41 @@ async fn main() -> std::io::Result<()> {
 
     info!("Starting Lacquer Monitor Backend...");
 
-    let pool = db::create_pool().expect("Failed to create database pool");
+    let app_config = config::AppConfig::from_env();
+
+    let pool = db::create_pool(&app_config.database)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
     if let Err(e) = db::init_db(&pool).await {
         tracing::error!("Database initialization failed: {}", e);
     }
 
-    let alert_config = alerts::AlertConfig::default();
-    let alert_pool = pool.clone();
+    let (alert_tx, alert_rx) = mpsc::channel::<nbiot_ingest::IngestEvent>(app_config.nbiot.channel_capacity);
+
+    let alert_broker_pool = pool.clone();
+    let alert_broker_config = app_config.alert.clone();
     tokio::spawn(async move {
-        alerts::run_alert_checker(alert_pool, alert_config).await;
+        let broker = alert_broker::AlertBroker::new(alert_broker_pool, alert_broker_config, alert_rx);
+        broker.run().await;
     });
 
-    let host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
-    let port: u16 = env::var("SERVER_PORT")
-        .unwrap_or_else(|_| "8080".to_string())
-        .parse()
-        .unwrap_or(8080);
-    let workers: usize = env::var("SERVER_WORKERS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or_else(num_cpus::get);
+    let ingest_service = nbiot_ingest::NbiotIngestService::new(
+        pool.clone(),
+        app_config.nbiot.clone(),
+        alert_tx,
+    );
+
+    let diffusion_service = moisture_diffusion::MoistureDiffusionService::new(
+        app_config.diffusion.clone(),
+    );
+
+    let penetration_service = peg_penetration::PegPenetrationService::new(
+        app_config.penetration.clone(),
+    );
+
+    let host = app_config.server.host.clone();
+    let port = app_config.server.port;
+    let workers = app_config.server.workers;
 
     info!("Server starting on {}:{} with {} workers", host, port, workers);
 
@@ -58,6 +75,9 @@ async fn main() -> std::io::Result<()> {
 
         App::new()
             .app_data(web::Data::new(pool.clone()))
+            .app_data(web::Data::new(ingest_service.clone()))
+            .app_data(web::Data::new(diffusion_service.clone()))
+            .app_data(web::Data::new(penetration_service.clone()))
             .wrap(cors)
             .wrap(middleware::Logger::default())
             .service(
