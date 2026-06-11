@@ -6,17 +6,22 @@ mod moisture_diffusion;
 mod peg_penetration;
 mod alert_broker;
 mod handlers;
+mod metrics;
 
 use actix_web::{web, App, HttpServer, middleware};
 use actix_cors::Cors;
+use actix_files as fs;
 use dotenvy::dotenv;
 use tokio::sync::mpsc;
 use tracing::{info, level_filters::LevelFilter};
 use tracing_subscriber::EnvFilter;
+use metrics::Metrics;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     dotenv().ok();
+
+    Metrics::init();
 
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -63,8 +68,10 @@ async fn main() -> std::io::Result<()> {
     let host = app_config.server.host.clone();
     let port = app_config.server.port;
     let workers = app_config.server.workers;
+    let static_dir = app_config.server.static_dir.clone();
 
     info!("Server starting on {}:{} with {} workers", host, port, workers);
+    info!("Serving static files from: {}", static_dir);
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -79,6 +86,7 @@ async fn main() -> std::io::Result<()> {
             .app_data(web::Data::new(diffusion_service.clone()))
             .app_data(web::Data::new(penetration_service.clone()))
             .wrap(cors)
+            .wrap(middleware::Compress::default())
             .wrap(middleware::Logger::default())
             .service(
                 web::scope("/api")
@@ -96,6 +104,12 @@ async fn main() -> std::io::Result<()> {
                     .route("/alerts", web::get().to(handlers::get_alerts))
                     .route("/nb-iot/data", web::post().to(handlers::receive_nb_iot_data))
                     .route("/nb-iot/batch", web::post().to(handlers::receive_nb_iot_batch))
+                    .route("/metrics", web::get().to(handlers::get_metrics))
+            )
+            .service(
+                fs::Files::new("/", &static_dir)
+                    .index_file("index.html")
+                    .default_handler(fs::NamedFile::open(format!("{}/index.html", static_dir)).unwrap())
             )
     })
     .workers(workers)
