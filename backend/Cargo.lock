@@ -1071,6 +1071,7 @@ dependencies = [
  "chrono",
  "deadpool-postgres",
  "dotenvy",
+ "num_cpus",
  "rand 0.8.6",
  "reqwest",
  "serde",
