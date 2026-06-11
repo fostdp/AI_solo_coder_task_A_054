@@ -16,6 +16,7 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub workers: usize,
+    pub static_dir: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +126,7 @@ impl AppConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or_else(num_cpus::get),
+            static_dir: env::var("STATIC_DIR").unwrap_or_else(|_| "../../frontend".to_string()),
         };
 
         let database = DatabaseConfig {
