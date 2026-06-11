@@ -285,6 +285,7 @@ class LacquerVisualizer {
         }
 
         colors.needsUpdate = true;
+        this.lacquerMesh.geometry.computeVertexNormals();
     }
 
     moistureToColor(moisture) {
@@ -299,7 +300,7 @@ class LacquerVisualizer {
     }
 
     updateStrainDeformation() {
-        if (!this.strainMesh || !this.baseVertices) return;
+        if (!this.lacquerMesh || !this.baseVertices) return;
 
         const strainValues = Object.values(this.strainData);
         const avgStrain = strainValues.length > 0
@@ -308,7 +309,7 @@ class LacquerVisualizer {
 
         const deformationFactor = 1 + avgStrain * 0.005;
         
-        const positions = this.strainMesh.geometry.attributes.position;
+        const positions = this.lacquerMesh.geometry.attributes.position;
         
         for (let i = 0; i < positions.count; i++) {
             const x = this.baseVertices[i * 3];
@@ -329,6 +330,28 @@ class LacquerVisualizer {
         }
 
         positions.needsUpdate = true;
+        this.lacquerMesh.geometry.computeVertexNormals();
+
+        if (this.strainMesh && this.strainMesh.geometry.attributes.position) {
+            const strainPositions = this.strainMesh.geometry.attributes.position;
+            for (let i = 0; i < strainPositions.count; i++) {
+                const x = this.baseVertices[i * 3];
+                const y = this.baseVertices[i * 3 + 1];
+                const z = this.baseVertices[i * 3 + 2];
+
+                const distFromCenter = Math.sqrt(x * x + y * y);
+                const edgeFactor = Math.min(1, distFromCenter * 2);
+                const deformation = 1 + edgeFactor * (deformationFactor - 1);
+
+                strainPositions.setXYZ(
+                    i,
+                    x * deformation,
+                    y * deformation,
+                    z * deformation
+                );
+            }
+            strainPositions.needsUpdate = true;
+        }
 
         const hue = Math.min(1, avgStrain / 10);
         const color = new THREE.Color().setHSL(0, 0.8, 0.5 - hue * 0.2);
