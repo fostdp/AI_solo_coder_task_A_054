@@ -309,3 +309,81 @@ $$ LANGUAGE plpgsql;
 
 -- 执行生成示例数据
 SELECT generate_sample_data();
+
+-- ============================================================
+-- TimescaleDB 压缩策略 - 原始数据保留2年
+-- ============================================================
+
+-- 启用含水率数据表压缩
+ALTER TABLE moisture_data SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'sensor_id, lacquer_ware_id',
+  timescaledb.compress_orderby = 'time DESC'
+);
+
+-- 启用应变数据表压缩
+ALTER TABLE strain_data SET (
+  timescaledb.compress,
+  timescaledb.compress_segmentby = 'sensor_id, lacquer_ware_id',
+  timescaledb.compress_orderby = 'time DESC'
+);
+
+-- 添加压缩策略：7天以上的数据自动压缩
+SELECT add_compression_policy('moisture_data', INTERVAL '7 days', if_not_exists => TRUE);
+SELECT add_compression_policy('strain_data', INTERVAL '7 days', if_not_exists => TRUE);
+
+-- 添加数据保留策略：原始数据保留2年，2年以上自动删除
+SELECT add_retention_policy('moisture_data', INTERVAL '2 years', if_not_exists => TRUE);
+SELECT add_retention_policy('strain_data', INTERVAL '2 years', if_not_exists => TRUE);
+
+-- 创建连续聚合视图：每日含水率统计
+CREATE MATERIALIZED VIEW IF NOT EXISTS moisture_daily_summary
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 day', time) AS bucket,
+  sensor_id,
+  lacquer_ware_id,
+  AVG(moisture_content) AS avg_moisture,
+  MIN(moisture_content) AS min_moisture,
+  MAX(moisture_content) AS max_moisture,
+  COUNT(*) AS reading_count
+FROM moisture_data
+GROUP BY bucket, sensor_id, lacquer_ware_id
+WITH NO DATA;
+
+-- 为连续聚合视图添加刷新策略
+SELECT add_continuous_aggregate_policy('moisture_daily_summary',
+  start_offset => INTERVAL '3 days',
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour',
+  if_not_exists => TRUE
+);
+
+-- 创建连续聚合视图：每日应变统计
+CREATE MATERIALIZED VIEW IF NOT EXISTS strain_daily_summary
+WITH (timescaledb.continuous) AS
+SELECT
+  time_bucket('1 day', time) AS bucket,
+  sensor_id,
+  lacquer_ware_id,
+  AVG(strain_value) AS avg_strain,
+  MIN(strain_value) AS min_strain,
+  MAX(strain_value) AS max_strain,
+  COUNT(*) AS reading_count
+FROM strain_data
+GROUP BY bucket, sensor_id, lacquer_ware_id
+WITH NO DATA;
+
+-- 为连续聚合视图添加刷新策略
+SELECT add_continuous_aggregate_policy('strain_daily_summary',
+  start_offset => INTERVAL '3 days',
+  end_offset => INTERVAL '1 hour',
+  schedule_interval => INTERVAL '1 hour',
+  if_not_exists => TRUE
+);
+
+-- 启用告警表索引
+CREATE INDEX IF NOT EXISTS idx_alerts_created ON alerts(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_alerts_type ON alerts(alert_type);
+CREATE INDEX IF NOT EXISTS idx_alerts_severity ON alerts(severity);
+CREATE INDEX IF NOT EXISTS idx_alerts_acknowledged ON alerts(is_acknowledged);
