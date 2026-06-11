@@ -1,12 +1,12 @@
 use crate::db::DbPool;
 use crate::models::*;
-use crate::algorithms::{FickianDiffusionModel, DarcyLawModel};
-use crate::alerts::AlertSystem;
+use crate::nbiot_ingest::NbiotIngestService;
+use crate::moisture_diffusion::MoistureDiffusionService;
+use crate::peg_penetration::PegPenetrationService;
 use actix_web::{web, HttpResponse, Responder};
 use chrono::{DateTime, Utc, Duration};
 use serde::Deserialize;
-use tokio_postgres::binary_copy::BinaryCopyInWriter;
-use tokio_postgres::types::Type;
+use tracing::warn;
 
 #[derive(Debug, Deserialize)]
 pub struct PaginationParams {
@@ -442,24 +442,34 @@ pub async fn get_latest_strain(
 }
 
 pub async fn predict_moisture_loss(
+    service: web::Data<MoistureDiffusionService>,
     body: web::Json<MoisturePredictionRequest>,
 ) -> impl Responder {
-    let model = FickianDiffusionModel::new(
-        body.diffusion_coefficient,
-        body.thickness,
-    );
+    let mut svc = service.get_ref().clone();
+    if let Some(d) = body.diffusion_coefficient {
+        svc = crate::moisture_diffusion::MoistureDiffusionService::new(crate::config::DiffusionConfig {
+            diffusion_coefficient: d,
+            ..svc.config().clone()
+        });
+    }
+    if let Some(t) = body.thickness {
+        svc = crate::moisture_diffusion::MoistureDiffusionService::new(crate::config::DiffusionConfig {
+            thickness: t,
+            ..svc.config().clone()
+        });
+    }
 
-    let (time_points, moisture_values, estimated_time) = model.predict_moisture_loss(
+    let (time_points, moisture_values, estimated_time) = svc.predict_loss(
         body.initial_moisture,
         body.target_moisture,
         body.time_hours,
-        100,
+        None,
     );
 
     let result = MoisturePredictionResult {
         time_points,
         moisture_values,
-        diffusion_coefficient: model.diffusion_coefficient,
+        diffusion_coefficient: svc.diffusion_coefficient(),
         estimated_dehydration_time_hours: estimated_time,
     };
 
@@ -471,26 +481,22 @@ pub async fn predict_moisture_loss(
 }
 
 pub async fn predict_penetration(
+    service: web::Data<PegPenetrationService>,
     body: web::Json<PenetrationPredictionRequest>,
 ) -> impl Responder {
-    let model = DarcyLawModel::new(
-        body.viscosity,
-        body.permeability,
-    );
+    let pressure_diff = body.pressure_diff;
 
-    let pressure_diff = body.pressure_diff.unwrap_or(101325.0);
-
-    let (time_points, depth_values, final_depth) = model.predict_penetration(
+    let (time_points, depth_values, final_depth) = service.predict(
         body.time_hours,
         pressure_diff,
-        0.05,
-        100,
+        Some(body.viscosity),
+        None,
     );
 
     let result = PenetrationPredictionResult {
         time_points,
         depth_values,
-        permeability: model.permeability,
+        permeability: service.permeability(),
         final_depth,
     };
 
@@ -557,51 +563,31 @@ pub async fn get_alerts(
     pool: web::Data<DbPool>,
     query: web::Query<PaginationParams>,
 ) -> impl Responder {
-    let alert_system = AlertSystem::new(pool.get_ref().clone(), crate::alerts::AlertConfig::default());
-    let limit = query.limit.unwrap_or(50);
-
-    match alert_system.get_recent_alerts(limit).await {
-        Ok(alerts) => HttpResponse::Ok().json(ApiResponse {
-            success: true,
-            message: "Success".to_string(),
-            data: Some(alerts),
-        }),
-        Err(e) => HttpResponse::InternalServerError().json(
+    let client = match pool.get().await {
+        Ok(c) => c,
+        Err(e) => return HttpResponse::InternalServerError().json(
             ApiResponse::<Vec<Alert>> {
                 success: false,
-                message: format!("Error: {}", e),
+                message: format!("Database error: {}", e),
                 data: None,
             }
         ),
-    }
-}
-
-pub async fn receive_nb_iot_data(
-    pool: web::Data<DbPool>,
-    body: web::Json<NbIotDataPacket>,
-) -> impl Responder {
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("Database connection pool error: {}", e);
-            tracing::warn!("NB-IoT data rejected: {}", msg);
-            return HttpResponse::ServiceUnavailable().json(
-                ApiResponse::<String> {
-                    success: false,
-                    message: msg,
-                    data: None,
-                }
-            );
-        }
     };
 
-    let sensor_row = match client.query_opt(
-        "SELECT id, lacquer_ware_id, sensor_type FROM sensors WHERE device_id = $1",
-        &[&body.device_id],
+    let limit = query.limit.unwrap_or(50);
+
+    let rows = match client.query(
+        r#"
+        SELECT id, alert_type, severity, lacquer_ware_id, sensor_id, message, value, threshold, is_acknowledged, created_at
+        FROM alerts
+        ORDER BY created_at DESC
+        LIMIT $1
+        "#,
+        &[&limit],
     ).await {
         Ok(r) => r,
         Err(e) => return HttpResponse::InternalServerError().json(
-            ApiResponse::<String> {
+            ApiResponse::<Vec<Alert>> {
                 success: false,
                 message: format!("Query error: {}", e),
                 data: None,
@@ -609,81 +595,90 @@ pub async fn receive_nb_iot_data(
         ),
     };
 
-    let (sensor_id, lacquer_ware_id, sensor_type) = match sensor_row {
-        Some(row) => (
-            row.get::<_, i32>("id"),
-            row.get::<_, Option<i32>>("lacquer_ware_id"),
-            row.get::<_, String>("sensor_type"),
-        ),
-        None => {
-            return HttpResponse::NotFound().json(ApiResponse::<String> {
-                success: false,
-                message: "Sensor not found".to_string(),
-                data: None,
-            });
-        }
-    };
-
-    let lacquer_id = match lacquer_ware_id {
-        Some(id) => id,
-        None => {
-            return HttpResponse::BadRequest().json(ApiResponse::<String> {
-                success: false,
-                message: "Sensor not assigned to any lacquer ware".to_string(),
-                data: None,
-            });
-        }
-    };
-
-    let result = if sensor_type == "moisture" {
-        client.execute(
-            r#"
-            INSERT INTO moisture_data (time, sensor_id, lacquer_ware_id, moisture_content, temperature, battery_level, signal_strength)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-            &[
-                &body.timestamp,
-                &sensor_id,
-                &lacquer_id,
-                &body.value,
-                &body.temperature,
-                &body.battery_level,
-                &body.signal_strength,
-            ],
-        ).await
-    } else if sensor_type == "strain" {
-        client.execute(
-            r#"
-            INSERT INTO strain_data (time, sensor_id, lacquer_ware_id, strain_value, temperature, battery_level, signal_strength)
-            VALUES ($1, $2, $3, $4, $5, $6, $7)
-            "#,
-            &[
-                &body.timestamp,
-                &sensor_id,
-                &lacquer_id,
-                &body.value,
-                &body.temperature,
-                &body.battery_level,
-                &body.signal_strength,
-            ],
-        ).await
-    } else {
-        return HttpResponse::BadRequest().json(ApiResponse::<String> {
-            success: false,
-            message: "Unknown sensor type".to_string(),
-            data: None,
+    let mut alerts = Vec::new();
+    for row in rows {
+        alerts.push(Alert {
+            id: row.get("id"),
+            alert_type: row.get("alert_type"),
+            severity: row.get("severity"),
+            lacquer_ware_id: row.get("lacquer_ware_id"),
+            sensor_id: row.get("sensor_id"),
+            message: row.get("message"),
+            value: row.get("value"),
+            threshold: row.get("threshold"),
+            is_acknowledged: row.get("is_acknowledged"),
+            created_at: row.get("created_at"),
         });
-    };
+    }
 
-    match result {
+    HttpResponse::Ok().json(ApiResponse {
+        success: true,
+        message: "Success".to_string(),
+        data: Some(alerts),
+    })
+}
+
+pub async fn receive_nb_iot_data(
+    ingest_service: web::Data<NbiotIngestService>,
+    body: web::Json<NbIotDataPacket>,
+) -> impl Responder {
+    match ingest_service.ingest_single(&body).await {
         Ok(_) => HttpResponse::Ok().json(ApiResponse {
             success: true,
             message: "Data received successfully".to_string(),
             data: Some("OK".to_string()),
         }),
+        Err(e) if e.contains("not found") || e.contains("not assigned") || e.contains("Unknown") => {
+            HttpResponse::BadRequest().json(ApiResponse::<String> {
+                success: false,
+                message: e,
+                data: None,
+            })
+        }
+        Err(e) if e.contains("pool") => {
+            warn!("NB-IoT data rejected: {}", e);
+            HttpResponse::ServiceUnavailable().json(ApiResponse::<String> {
+                success: false,
+                message: e,
+                data: None,
+            })
+        }
         Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<String> {
             success: false,
-            message: format!("Insert error: {}", e),
+            message: e,
+            data: None,
+        }),
+    }
+}
+
+pub async fn receive_nb_iot_batch(
+    ingest_service: web::Data<NbiotIngestService>,
+    body: web::Json<Vec<NbIotDataPacket>>,
+) -> impl Responder {
+    match ingest_service.ingest_batch(&body).await {
+        Ok((success, fail)) => HttpResponse::Ok().json(ApiResponse {
+            success: true,
+            message: format!("Batch processed: {} success, {} failed", success, fail),
+            data: Some(format!("{}/{}", success, success + fail)),
+        }),
+        Err(e) if e.contains("Batch size") => {
+            HttpResponse::BadRequest().json(ApiResponse::<String> {
+                success: false,
+                message: e,
+                data: None,
+            })
+        }
+        Err(e) if e.contains("pool") => {
+            warn!("NB-IoT batch rejected: {}", e);
+            HttpResponse::ServiceUnavailable().json(ApiResponse::<String> {
+                success: false,
+                message: e,
+                data: None,
+            })
+        }
+        Err(e) => HttpResponse::InternalServerError().json(ApiResponse::<String> {
+            success: false,
+            message: e,
             data: None,
         }),
     }
@@ -740,248 +735,4 @@ pub async fn get_statistics(
         message: "Success".to_string(),
         data: Some(serde_json::Value::Object(stats)),
     })
-}
-
-pub async fn receive_nb_iot_batch(
-    pool: web::Data<DbPool>,
-    body: web::Json<Vec<NbIotDataPacket>>,
-) -> impl Responder {
-    if body.len() > 100 {
-        return HttpResponse::BadRequest().json(ApiResponse::<String> {
-            success: false,
-            message: "Batch size exceeds limit of 100".to_string(),
-            data: None,
-        });
-    }
-
-    let client = match pool.get().await {
-        Ok(c) => c,
-        Err(e) => {
-            let msg = format!("Database connection pool error: {}", e);
-            tracing::warn!("NB-IoT batch rejected: {}", msg);
-            return HttpResponse::ServiceUnavailable().json(
-                ApiResponse::<String> {
-                    success: false,
-                    message: msg,
-                    data: None,
-                }
-            );
-        }
-    };
-
-    let device_ids: Vec<String> = body.iter().map(|p| p.device_id.clone()).collect();
-
-    let sensor_rows = match client.query(
-        "SELECT id, device_id, lacquer_ware_id, sensor_type FROM sensors WHERE device_id = ANY($1)",
-        &[&device_ids],
-    ).await {
-        Ok(r) => r,
-        Err(e) => {
-            return HttpResponse::InternalServerError().json(ApiResponse::<String> {
-                success: false,
-                message: format!("Sensor lookup failed: {}", e),
-                data: None,
-            });
-        }
-    };
-
-    let mut sensor_map: std::collections::HashMap<String, (i32, i32, String)> =
-        std::collections::HashMap::new();
-    for row in sensor_rows {
-        let id: i32 = row.get("id");
-        let device_id: String = row.get("device_id");
-        let lacquer_ware_id: Option<i32> = row.get("lacquer_ware_id");
-        let sensor_type: String = row.get("sensor_type");
-        if let Some(lid) = lacquer_ware_id {
-            sensor_map.insert(device_id, (id, lid, sensor_type));
-        }
-    }
-
-    let mut moisture_rows: Vec<(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)> = Vec::new();
-    let mut strain_rows: Vec<(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)> = Vec::new();
-    let mut fail_count = 0usize;
-
-    for packet in body.iter() {
-        match sensor_map.get(&packet.device_id) {
-            Some((sensor_id, lacquer_id, sensor_type)) => {
-                let row = (
-                    packet.timestamp,
-                    *sensor_id,
-                    *lacquer_id,
-                    packet.value,
-                    packet.temperature,
-                    packet.battery_level,
-                    packet.signal_strength,
-                );
-                if sensor_type == "moisture" {
-                    moisture_rows.push(row);
-                } else if sensor_type == "strain" {
-                    strain_rows.push(row);
-                } else {
-                    fail_count += 1;
-                }
-            }
-            None => { fail_count += 1; }
-        }
-    }
-
-    let mut success_count: usize = 0;
-
-    if !moisture_rows.is_empty() {
-        let inserted = batch_copy_insert_moisture(&client, &moisture_rows).await;
-        success_count += inserted;
-        fail_count += moisture_rows.len() - inserted;
-    }
-
-    if !strain_rows.is_empty() {
-        let inserted = batch_copy_insert_strain(&client, &strain_rows).await;
-        success_count += inserted;
-        fail_count += strain_rows.len() - inserted;
-    }
-
-    HttpResponse::Ok().json(ApiResponse {
-        success: true,
-        message: format!("Batch processed: {} success, {} failed", success_count, fail_count),
-        data: Some(format!("{}/{}", success_count, success_count + fail_count)),
-    })
-}
-
-async fn batch_copy_insert_moisture(
-    client: &deadpool_postgres::Object,
-    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
-) -> usize {
-    let copy_stmt = match client.prepare(
-        "COPY moisture_data (time, sensor_id, lacquer_ware_id, moisture_content, temperature, battery_level, signal_strength) FROM STDIN WITH (FORMAT binary)"
-    ).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("COPY moisture_data prepare failed, falling back to INSERT: {}", e);
-            return batch_fallback_insert_moisture(client, rows).await;
-        }
-    };
-
-    let types = [Type::TIMESTAMPTZ, Type::INT4, Type::INT4, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8];
-    let sink = match client.copy_in(&copy_stmt).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("COPY moisture_data init failed, falling back: {}", e);
-            return batch_fallback_insert_moisture(client, rows).await;
-        }
-    };
-
-    let writer = BinaryCopyInWriter::new(sink, &types);
-    let mut writer = std::pin::pin!(writer);
-
-    for row in rows {
-        if writer.as_mut().write(&[
-            &row.0 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.1 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.2 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.3 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.4 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.5 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.6 as &(dyn tokio_postgres::types::ToSql + Sync),
-        ]).await.is_err() {
-            tracing::error!("COPY moisture_data write failed");
-            return batch_fallback_insert_moisture(client, rows).await;
-        }
-    }
-
-    match writer.finish().await {
-        Ok(_) => {
-            tracing::info!("COPY moisture_data: {} rows via binary COPY", rows.len());
-            rows.len()
-        }
-        Err(e) => {
-            tracing::error!("COPY moisture_data finish failed: {}", e);
-            batch_fallback_insert_moisture(client, rows).await
-        }
-    }
-}
-
-async fn batch_fallback_insert_moisture(
-    client: &deadpool_postgres::Object,
-    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
-) -> usize {
-    let mut count = 0usize;
-    for row in rows {
-        match client.execute(
-            "INSERT INTO moisture_data (time, sensor_id, lacquer_ware_id, moisture_content, temperature, battery_level, signal_strength) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[&row.0, &row.1, &row.2, &row.3, &row.4, &row.5, &row.6],
-        ).await {
-            Ok(_) => count += 1,
-            Err(e) => tracing::warn!("Fallback INSERT moisture failed: {}", e),
-        }
-    }
-    count
-}
-
-async fn batch_copy_insert_strain(
-    client: &deadpool_postgres::Object,
-    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
-) -> usize {
-    let copy_stmt = match client.prepare(
-        "COPY strain_data (time, sensor_id, lacquer_ware_id, strain_value, temperature, battery_level, signal_strength) FROM STDIN WITH (FORMAT binary)"
-    ).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("COPY strain_data prepare failed, falling back to INSERT: {}", e);
-            return batch_fallback_insert_strain(client, rows).await;
-        }
-    };
-
-    let types = [Type::TIMESTAMPTZ, Type::INT4, Type::INT4, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8, Type::FLOAT8];
-    let sink = match client.copy_in(&copy_stmt).await {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!("COPY strain_data init failed, falling back: {}", e);
-            return batch_fallback_insert_strain(client, rows).await;
-        }
-    };
-
-    let writer = BinaryCopyInWriter::new(sink, &types);
-    let mut writer = std::pin::pin!(writer);
-
-    for row in rows {
-        if writer.as_mut().write(&[
-            &row.0 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.1 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.2 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.3 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.4 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.5 as &(dyn tokio_postgres::types::ToSql + Sync),
-            &row.6 as &(dyn tokio_postgres::types::ToSql + Sync),
-        ]).await.is_err() {
-            tracing::error!("COPY strain_data write failed");
-            return batch_fallback_insert_strain(client, rows).await;
-        }
-    }
-
-    match writer.finish().await {
-        Ok(_) => {
-            tracing::info!("COPY strain_data: {} rows via binary COPY", rows.len());
-            rows.len()
-        }
-        Err(e) => {
-            tracing::error!("COPY strain_data finish failed: {}", e);
-            batch_fallback_insert_strain(client, rows).await
-        }
-    }
-}
-
-async fn batch_fallback_insert_strain(
-    client: &deadpool_postgres::Object,
-    rows: &[(DateTime<Utc>, i32, i32, f64, Option<f64>, Option<f64>, Option<f64>)],
-) -> usize {
-    let mut count = 0usize;
-    for row in rows {
-        match client.execute(
-            "INSERT INTO strain_data (time, sensor_id, lacquer_ware_id, strain_value, temperature, battery_level, signal_strength) VALUES ($1, $2, $3, $4, $5, $6, $7)",
-            &[&row.0, &row.1, &row.2, &row.3, &row.4, &row.5, &row.6],
-        ).await {
-            Ok(_) => count += 1,
-            Err(e) => tracing::warn!("Fallback INSERT strain failed: {}", e),
-        }
-    }
-    count
 }
