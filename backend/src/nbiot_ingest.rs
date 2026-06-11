@@ -1,6 +1,7 @@
 use crate::db::DbPool;
 use crate::config::NbIotConfig;
 use crate::models::{NbIotDataPacket, MoistureData, StrainData};
+use crate::metrics::Metrics;
 use tokio::sync::mpsc::Sender;
 use tokio_postgres::binary_copy::BinaryCopyInWriter;
 use tokio_postgres::types::Type;
@@ -31,12 +32,18 @@ impl NbiotIngestService {
 
     pub async fn ingest_single(&self, packet: &NbIotDataPacket) -> Result<(), String> {
         let client = self.pool.get().await
-            .map_err(|e| format!("Database pool error: {}", e))?;
+            .map_err(|e| {
+                Metrics::get().nbiot_packets_failed.inc();
+                format!("Database pool error: {}", e)
+            })?;
 
         let sensor_row = client.query_opt(
             "SELECT id, lacquer_ware_id, sensor_type FROM sensors WHERE device_id = $1",
             &[&packet.device_id],
-        ).await.map_err(|e| format!("Sensor lookup error: {}", e))?;
+        ).await.map_err(|e| {
+            Metrics::get().nbiot_packets_failed.inc();
+            format!("Sensor lookup error: {}", e)
+        })?;
 
         let (sensor_id, lacquer_id, sensor_type) = match sensor_row {
             Some(row) => (
@@ -44,10 +51,19 @@ impl NbiotIngestService {
                 row.get::<_, Option<i32>>("lacquer_ware_id"),
                 row.get::<_, String>("sensor_type"),
             ),
-            None => return Err("Sensor not found".to_string()),
+            None => {
+                Metrics::get().nbiot_packets_failed.inc();
+                return Err("Sensor not found".to_string());
+            }
         };
 
-        let lacquer_id = lacquer_id.ok_or_else(|| "Sensor not assigned to any lacquer ware".to_string())?;
+        let lacquer_id = match lacquer_id {
+            Some(id) => id,
+            None => {
+                Metrics::get().nbiot_packets_failed.inc();
+                return Err("Sensor not assigned to any lacquer ware".to_string());
+            }
+        };
 
         match sensor_type.as_str() {
             "moisture" => {
@@ -65,7 +81,13 @@ impl NbiotIngestService {
                         &packet.battery_level,
                         &packet.signal_strength,
                     ],
-                ).await.map_err(|e| format!("Insert error: {}", e))?;
+                ).await.map_err(|e| {
+                    Metrics::get().nbiot_packets_failed.inc();
+                    format!("Insert error: {}", e)
+                })?;
+
+                Metrics::get().nbiot_packets_total.inc();
+                Metrics::get().moisture_readings_total.inc();
 
                 let data = MoistureData {
                     time: packet.timestamp,
@@ -97,7 +119,13 @@ impl NbiotIngestService {
                         &packet.battery_level,
                         &packet.signal_strength,
                     ],
-                ).await.map_err(|e| format!("Insert error: {}", e))?;
+                ).await.map_err(|e| {
+                    Metrics::get().nbiot_packets_failed.inc();
+                    format!("Insert error: {}", e)
+                })?;
+
+                Metrics::get().nbiot_packets_total.inc();
+                Metrics::get().strain_readings_total.inc();
 
                 let data = StrainData {
                     time: packet.timestamp,
@@ -114,7 +142,10 @@ impl NbiotIngestService {
                     warn!("Alert channel full, dropping event: {}", e);
                 }
             }
-            _ => return Err("Unknown sensor type".to_string()),
+            _ => {
+                Metrics::get().nbiot_packets_failed.inc();
+                return Err("Unknown sensor type".to_string());
+            }
         }
 
         Ok(())
@@ -225,6 +256,12 @@ impl NbiotIngestService {
         }
 
         info!("NB-IoT batch ingest: {}/{} succeeded, {} failed", success_count, success_count + fail_count, fail_count);
+
+        let metrics = Metrics::get();
+        metrics.nbiot_packets_total.inc_by(success_count as u64);
+        metrics.nbiot_packets_failed.inc_by(fail_count as u64);
+        metrics.moisture_readings_total.inc_by(moisture_rows.len() as u64);
+        metrics.strain_readings_total.inc_by(strain_rows.len() as u64);
 
         Ok((success_count, fail_count))
     }
