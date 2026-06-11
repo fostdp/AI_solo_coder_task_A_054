@@ -3,8 +3,10 @@ use crate::models::*;
 use crate::nbiot_ingest::NbiotIngestService;
 use crate::moisture_diffusion::MoistureDiffusionService;
 use crate::peg_penetration::PegPenetrationService;
+use crate::metrics::Metrics;
 use actix_web::{web, HttpResponse, Responder};
 use chrono::{DateTime, Utc, Duration};
+use prometheus::Encoder;
 use serde::Deserialize;
 use tracing::warn;
 
@@ -735,4 +737,19 @@ pub async fn get_statistics(
         message: "Success".to_string(),
         data: Some(serde_json::Value::Object(stats)),
     })
+}
+
+pub async fn get_metrics() -> impl Responder {
+    Metrics::get().http_requests_total.inc();
+    let metric_families = Metrics::gather();
+    let encoder = prometheus::TextEncoder::new();
+    let mut buffer = Vec::new();
+
+    match encoder.encode(&metric_families, &mut buffer) {
+        Ok(()) => HttpResponse::Ok()
+            .content_type("text/plain; version=0.0.4; charset=utf-8")
+            .body(buffer),
+        Err(e) => HttpResponse::InternalServerError()
+            .body(format!("Failed to encode metrics: {}", e)),
+    }
 }
