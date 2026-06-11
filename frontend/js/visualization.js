@@ -141,8 +141,9 @@ class LacquerVisualizer {
     }
 
     createStrainMesh() {
-        const geometry = new THREE.WireframeGeometry(this.baseGeometry.clone());
-        
+        const geometry = new THREE.WireframeGeometry(this.baseGeometry);
+        this.strainBaseVertices = new Float32Array(geometry.attributes.position.array);
+
         const material = new THREE.LineBasicMaterial({
             color: 0xe74c3c,
             transparent: true,
@@ -308,10 +309,11 @@ class LacquerVisualizer {
             : 1;
 
         const deformationFactor = 1 + avgStrain * 0.005;
-        
+
         const positions = this.lacquerMesh.geometry.attributes.position;
-        
-        for (let i = 0; i < positions.count; i++) {
+        const baseCount = this.baseVertices.length / 3;
+
+        for (let i = 0; i < baseCount; i++) {
             const x = this.baseVertices[i * 3];
             const y = this.baseVertices[i * 3 + 1];
             const z = this.baseVertices[i * 3 + 2];
@@ -321,34 +323,26 @@ class LacquerVisualizer {
 
             const deformation = 1 + edgeFactor * (deformationFactor - 1);
 
-            positions.setXYZ(
-                i,
-                x * deformation,
-                y * deformation,
-                z * deformation
-            );
+            positions.setXYZ(i, x * deformation, y * deformation, z * deformation);
         }
 
         positions.needsUpdate = true;
         this.lacquerMesh.geometry.computeVertexNormals();
 
-        if (this.strainMesh && this.strainMesh.geometry.attributes.position) {
+        if (this.strainMesh && this.strainBaseVertices && this.strainMesh.geometry.attributes.position) {
             const strainPositions = this.strainMesh.geometry.attributes.position;
-            for (let i = 0; i < strainPositions.count; i++) {
-                const x = this.baseVertices[i * 3];
-                const y = this.baseVertices[i * 3 + 1];
-                const z = this.baseVertices[i * 3 + 2];
+            const strainCount = this.strainBaseVertices.length / 3;
+
+            for (let i = 0; i < strainCount; i++) {
+                const x = this.strainBaseVertices[i * 3];
+                const y = this.strainBaseVertices[i * 3 + 1];
+                const z = this.strainBaseVertices[i * 3 + 2];
 
                 const distFromCenter = Math.sqrt(x * x + y * y);
                 const edgeFactor = Math.min(1, distFromCenter * 2);
                 const deformation = 1 + edgeFactor * (deformationFactor - 1);
 
-                strainPositions.setXYZ(
-                    i,
-                    x * deformation,
-                    y * deformation,
-                    z * deformation
-                );
+                strainPositions.setXYZ(i, x * deformation, y * deformation, z * deformation);
             }
             strainPositions.needsUpdate = true;
         }
