@@ -20,6 +20,7 @@ class NbIoTSimulator:
         self.strain_sensors = []
         self.moisture_history = {}
         self.strain_history = {}
+        self.signal_base = {}
         self._init_sensors()
 
     def _init_sensors(self):
@@ -27,11 +28,22 @@ class NbIoTSimulator:
             device_id = f"MS{i:04d}"
             self.moisture_sensors.append(device_id)
             self.moisture_history[device_id] = 75.0 + random.uniform(-5, 10)
+            self.signal_base[device_id] = random.uniform(-65, -80)
 
         for i in range(1, 21):
             device_id = f"SS{i:04d}"
             self.strain_sensors.append(device_id)
             self.strain_history[device_id] = 0.5 + random.uniform(-0.2, 1.0)
+            self.signal_base[device_id] = random.uniform(-65, -80)
+
+    def _simulate_signal_attenuation(self, device_id: str) -> float:
+        base = self.signal_base.get(device_id, -70.0)
+        rain_attenuation = random.uniform(0, 5) if random.random() < 0.3 else 0
+        distance_attenuation = random.uniform(0, 3)
+        obstacle_attenuation = random.uniform(5, 15) if random.random() < 0.1 else 0
+        fading = random.gauss(0, 2)
+        signal = base - rain_attenuation - distance_attenuation - obstacle_attenuation + fading
+        return round(max(-120.0, min(-40.0, signal)), 1)
 
     def generate_moisture_data(self, device_id: str) -> Dict:
         prev_value = self.moisture_history.get(device_id, 75.0)
@@ -55,7 +67,7 @@ class NbIoTSimulator:
             "value": round(new_value, 2),
             "temperature": round(20 + random.uniform(-3, 5), 1),
             "battery_level": round(80 + random.uniform(-5, 15), 1),
-            "signal_strength": round(-70 + random.uniform(-20, 10), 1)
+            "signal_strength": self._simulate_signal_attenuation(device_id)
         }
 
     def generate_strain_data(self, device_id: str) -> Dict:
@@ -80,7 +92,7 @@ class NbIoTSimulator:
             "value": round(new_value, 3),
             "temperature": round(20 + random.uniform(-3, 5), 1),
             "battery_level": round(80 + random.uniform(-5, 15), 1),
-            "signal_strength": round(-70 + random.uniform(-20, 10), 1)
+            "signal_strength": self._simulate_signal_attenuation(device_id)
         }
 
     def send_data(self, data: Dict) -> bool:
