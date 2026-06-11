@@ -1,6 +1,7 @@
 const API_BASE = 'http://localhost:8080/api';
 
-let visualizer = null;
+let lacquerModel = null;
+let moistureHeatmap = null;
 let selectedWareId = 1;
 let currentMode = 'moisture';
 let moistureChartCtx = null;
@@ -17,8 +18,9 @@ document.addEventListener('DOMContentLoaded', () => {
 });
 
 function initVisualizer() {
-    visualizer = new LacquerVisualizer('threeCanvas');
-    visualizer.setMode('moisture');
+    lacquerModel = new LacquerModel('threeCanvas');
+    moistureHeatmap = new MoistureHeatmap(lacquerModel);
+    lacquerModel.setMode('moisture');
 
     const mockMoisture = {};
     const mockStrain = {};
@@ -28,8 +30,8 @@ function initVisualizer() {
     for (let i = 0; i < 4; i++) {
         mockStrain[`strain_${i}`] = 1 + Math.random() * 2;
     }
-    visualizer.updateMoistureData(mockMoisture);
-    visualizer.updateStrainData(mockStrain);
+    moistureHeatmap.updateData(mockMoisture);
+    lacquerModel.updateStrainData(mockStrain);
 }
 
 function initCharts() {
@@ -269,28 +271,28 @@ function initEventListeners() {
             btn.classList.add('active');
             const mode = btn.dataset.mode;
             currentMode = mode;
-            visualizer.setMode(mode);
+            lacquerModel.setMode(mode);
         });
     });
 
     document.getElementById('resetView').addEventListener('click', () => {
-        visualizer.resetView();
+        lacquerModel.resetView();
     });
 
     document.getElementById('toggleWireframe').addEventListener('click', () => {
-        visualizer.toggleWireframe();
+        lacquerModel.toggleWireframe();
     });
 
     document.getElementById('toggleAutoRotate').addEventListener('click', () => {
-        visualizer.toggleAutoRotate();
+        lacquerModel.toggleAutoRotate();
     });
 
     document.getElementById('zoomIn').addEventListener('click', () => {
-        visualizer.zoomIn();
+        lacquerModel.zoomIn();
     });
 
     document.getElementById('zoomOut').addEventListener('click', () => {
-        visualizer.zoomOut();
+        lacquerModel.zoomOut();
     });
 }
 
@@ -377,7 +379,7 @@ async function loadWareData(wareId) {
             moistureData.data.forEach(d => {
                 moistureMap[`sensor_${d.sensor_id}`] = d.moisture_content;
             });
-            visualizer.updateMoistureData(moistureMap);
+            moistureHeatmap.updateData(moistureMap);
         }
 
         if (strainData.success && strainData.data) {
@@ -385,7 +387,7 @@ async function loadWareData(wareId) {
             strainData.data.forEach(d => {
                 strainMap[`strain_${d.sensor_id}`] = d.strain_value;
             });
-            visualizer.updateStrainData(strainMap);
+            lacquerModel.updateStrainData(strainMap);
         }
 
         updateSensorInfo(moistureData.data || [], strainData.data || []);
