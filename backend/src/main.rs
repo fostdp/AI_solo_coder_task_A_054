@@ -42,8 +42,12 @@ async fn main() -> std::io::Result<()> {
         .unwrap_or_else(|_| "8080".to_string())
         .parse()
         .unwrap_or(8080);
+    let workers: usize = env::var("SERVER_WORKERS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_else(num_cpus::get);
 
-    info!("Server starting on {}:{}", host, port);
+    info!("Server starting on {}:{} with {} workers", host, port, workers);
 
     HttpServer::new(move || {
         let cors = Cors::default()
@@ -71,8 +75,10 @@ async fn main() -> std::io::Result<()> {
                     .route("/reinforcement-agents", web::get().to(handlers::get_reinforcement_agents))
                     .route("/alerts", web::get().to(handlers::get_alerts))
                     .route("/nb-iot/data", web::post().to(handlers::receive_nb_iot_data))
+                    .route("/nb-iot/batch", web::post().to(handlers::receive_nb_iot_batch))
             )
     })
+    .workers(workers)
     .bind((host.as_str(), port))?
     .run()
     .await
